@@ -297,7 +297,9 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> dic
     }
 
 
-@mcp.tool()
+# Disabled: this MCP server is used read-only (triage/summarize). Sending is
+# turned off to remove the "act" leg of the prompt-injection trifecta.
+# @mcp.tool()
 def send_message(
     recipient: str,
     message: str,
@@ -332,7 +334,8 @@ def send_message(
     return {"success": success, "message": status_message}
 
 
-@mcp.tool()
+# Disabled: read-only setup, sending/reacting not needed (see send_message above).
+# @mcp.tool()
 def send_reaction(
     recipient: str,
     message_id: str,
@@ -358,7 +361,8 @@ def send_reaction(
     return {"success": success, "message": status_message}
 
 
-@mcp.tool()
+# Disabled: read-only setup, sending files not needed (see send_message above).
+# @mcp.tool()
 def send_file(recipient: str, media_path: str) -> dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
 
@@ -376,7 +380,8 @@ def send_file(recipient: str, media_path: str) -> dict[str, Any]:
     return {"success": success, "message": status_message}
 
 
-@mcp.tool()
+# Disabled: read-only setup, sending audio not needed (see send_message above).
+# @mcp.tool()
 def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
 
