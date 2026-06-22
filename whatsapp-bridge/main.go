@@ -2549,13 +2549,33 @@ connectionSuccess:
 	client.Disconnect()
 }
 
+// isPlainPhoneNumber reports whether s is a bare phone number (all digits with
+// an optional leading +).  A chat whose stored name is only a phone number
+// never had its contact name resolved, so GetChatName should keep retrying
+// GetContact() rather than locking in the phone number forever.
+func isPlainPhoneNumber(s string) bool {
+	s = strings.TrimPrefix(s, "+")
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
+	// First, check if chat already exists in database with a real name.
+	// If the stored name is a bare phone number the contact sync may not have
+	// run yet when the chat was first created; fall through so GetContact()
+	// gets another chance to return FullName.
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	if err == nil && existingName != "" && !isPlainPhoneNumber(existingName) {
+		// Chat exists with a real name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}

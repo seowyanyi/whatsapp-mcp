@@ -260,56 +260,39 @@ def _resolve_name_from_whatsmeow(jid: str) -> str | None:
 
 
 def get_sender_name(sender_jid: str) -> str:
+    # Prefer full_name from whatsmeow contact store (whatsapp.db), which is
+    # populated by the phone's contact-list sync and uses the fallback chain
+    # full_name → push_name → first_name → business_name.  Checking this
+    # first avoids returning a stale push_name or bare phone number that the
+    # bridge may have cached in messages.db before the contact sync ran.
+    whatsmeow_name = _resolve_name_from_whatsmeow(sender_jid)
+    if not whatsmeow_name and "@" not in sender_jid:
+        # Bare phone number — retry with canonical @s.whatsapp.net suffix.
+        whatsmeow_name = _resolve_name_from_whatsmeow(sender_jid + "@s.whatsapp.net")
+    if whatsmeow_name:
+        return whatsmeow_name
+
+    # Fall back to messages.db chats table (may contain a push_name or phone number).
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
-        # First try matching by exact JID
-        cursor.execute(
-            """
-            SELECT name
-            FROM chats
-            WHERE jid = ?
-            LIMIT 1
-        """,
-            (sender_jid,),
-        )
-
+        cursor.execute("SELECT name FROM chats WHERE jid = ? LIMIT 1", (sender_jid,))
         result = cursor.fetchone()
 
-        # If no result, try looking for the number within JIDs
         if not result:
-            # Extract the phone number part if it's a JID
-            if "@" in sender_jid:
-                phone_part = sender_jid.split("@")[0]
-            else:
-                phone_part = sender_jid
-
+            phone_part = sender_jid.split("@")[0] if "@" in sender_jid else sender_jid
+            # Exclude @g.us group JIDs: a group creator's phone appears in the
+            # group's JID prefix, which would otherwise return the group name
+            # as the sender's display name.
             cursor.execute(
-                """
-                SELECT name
-                FROM chats
-                WHERE jid LIKE ?
-                LIMIT 1
-            """,
+                "SELECT name FROM chats WHERE jid LIKE ? AND jid NOT LIKE '%@g.us' LIMIT 1",
                 (f"%{phone_part}%",),
             )
-
             result = cursor.fetchone()
 
         if result and result[0] and not result[0].replace("+", "").isdigit():
             return result[0]
-
-        # Fall back to whatsmeow contact store
-        whatsmeow_name = _resolve_name_from_whatsmeow(sender_jid)
-        if whatsmeow_name:
-            return whatsmeow_name
-
-        # Try with @s.whatsapp.net suffix if bare number
-        if "@" not in sender_jid:
-            whatsmeow_name = _resolve_name_from_whatsmeow(sender_jid + "@s.whatsapp.net")
-            if whatsmeow_name:
-                return whatsmeow_name
 
         return sender_jid
 
