@@ -121,6 +121,8 @@ func NewMessageStore() (*MessageStore, error) {
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
 			deleted_at TIMESTAMP,
+			sender_display TEXT,
+			content_display TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -168,6 +170,12 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 	}
 	if err := ensureColumn(db, "messages", "quoted_message_id", "TEXT"); err != nil {
 		return fmt.Errorf("failed to ensure messages.quoted_message_id column: %w", err)
+	}
+	if err := ensureColumn(db, "messages", "sender_display", "TEXT"); err != nil {
+		return fmt.Errorf("failed to ensure messages.sender_display column: %w", err)
+	}
+	if err := ensureColumn(db, "messages", "content_display", "TEXT"); err != nil {
+		return fmt.Errorf("failed to ensure messages.content_display column: %w", err)
 	}
 	return nil
 }
@@ -618,7 +626,7 @@ func (store *MessageStore) GetChatEphemeralSettings(jid string) (ChatEphemeralSe
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
-	quotedMessageId string) error {
+	quotedMessageId, senderDisplay, contentDisplay string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -633,11 +641,21 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	if quotedMessageId != "" {
 		qmid = quotedMessageId
 	}
+	// Same pattern for display columns: only write non-empty strings so a
+	// later update (e.g. from a live message arriving after a history-sync row)
+	// can fill in a previously-empty value without a separate backfill script.
+	var sdisplay, cdisplay interface{}
+	if senderDisplay != "" {
+		sdisplay = senderDisplay
+	}
+	if contentDisplay != "" {
+		cdisplay = contentDisplay
+	}
 
 	_, err := store.db.Exec(
 		`INSERT INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, sender_display, content_display)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id, chat_jid) DO UPDATE SET
 			sender = excluded.sender,
 			content = excluded.content,
@@ -650,8 +668,10 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 			file_sha256 = excluded.file_sha256,
 			file_enc_sha256 = excluded.file_enc_sha256,
 			file_length = excluded.file_length,
-			quoted_message_id = COALESCE(excluded.quoted_message_id, messages.quoted_message_id)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, qmid,
+			quoted_message_id = COALESCE(excluded.quoted_message_id, messages.quoted_message_id),
+			sender_display = COALESCE(excluded.sender_display, messages.sender_display),
+			content_display = COALESCE(excluded.content_display, messages.content_display)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, qmid, sdisplay, cdisplay,
 	)
 	return err
 }
@@ -1258,6 +1278,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		if storeErr := messageStore.StoreMessage(
 			resp.ID, chatJID, senderUser, message, timestamp, true,
 			mediaType, filename, "", nil, nil, nil, 0, quotedMsgID,
+			"Me", message,
 		); storeErr != nil {
 			fmt.Printf("Warning: failed to persist outbound message: %v\n", storeErr)
 		}
@@ -1432,6 +1453,80 @@ func senderAltForMessage(client *whatsmeow.Client, info types.MessageInfo) types
 	return types.EmptyJID
 }
 
+// resolveSenderDisplay returns the best human-readable name for a message sender.
+// It checks whatsmeow's in-memory contact store (populated from the phone's
+// contact list) before falling back to the live push name or the bare JID user.
+func resolveSenderDisplay(client *whatsmeow.Client, sender types.JID, isFromMe bool, pushName string) string {
+	if isFromMe {
+		return "Me"
+	}
+	contact, err := client.Store.Contacts.GetContact(context.Background(), sender)
+	if err == nil {
+		if contact.FullName != "" {
+			return contact.FullName
+		}
+		if contact.PushName != "" {
+			return contact.PushName
+		}
+	}
+	if pushName != "" {
+		return pushName
+	}
+	return sender.User
+}
+
+// extractMentionedJIDs returns the MentionedJID list from the first ContextInfo
+// found in the message proto, or nil if none is present.
+func extractMentionedJIDs(msg *waProto.Message) []string {
+	if msg == nil {
+		return nil
+	}
+	var ctx *waProto.ContextInfo
+	switch {
+	case msg.GetExtendedTextMessage() != nil:
+		ctx = msg.GetExtendedTextMessage().GetContextInfo()
+	case msg.GetImageMessage() != nil:
+		ctx = msg.GetImageMessage().GetContextInfo()
+	case msg.GetVideoMessage() != nil:
+		ctx = msg.GetVideoMessage().GetContextInfo()
+	case msg.GetAudioMessage() != nil:
+		ctx = msg.GetAudioMessage().GetContextInfo()
+	case msg.GetDocumentMessage() != nil:
+		ctx = msg.GetDocumentMessage().GetContextInfo()
+	case msg.GetStickerMessage() != nil:
+		ctx = msg.GetStickerMessage().GetContextInfo()
+	}
+	if ctx == nil {
+		return nil
+	}
+	return ctx.GetMentionedJID()
+}
+
+// resolveContentMentions replaces @<jid_user> tokens in content with @<display_name>
+// using whatsmeow's in-memory contact store. Unresolvable JIDs are left as-is.
+func resolveContentMentions(client *whatsmeow.Client, content string, mentionedJIDs []string) string {
+	if len(mentionedJIDs) == 0 || content == "" {
+		return content
+	}
+	for _, jidStr := range mentionedJIDs {
+		jid, err := types.ParseJID(jidStr)
+		if err != nil {
+			continue
+		}
+		name := jid.User
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
+		if err == nil {
+			if contact.FullName != "" {
+				name = contact.FullName
+			} else if contact.PushName != "" {
+				name = contact.PushName
+			}
+		}
+		content = strings.ReplaceAll(content, "@"+jid.User, "@"+name)
+	}
+	return content
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Resolve LID-based chats to phone-based JIDs so that incoming
@@ -1457,6 +1552,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			name = pushName
 		}
 	}
+
+	// Resolve a human-readable sender name once; used for both reactions and
+	// regular messages below so we don't call GetContact twice.
+	senderDisplay := resolveSenderDisplay(client, resolvedSender, msg.Info.IsFromMe, msg.Info.PushName)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -1495,6 +1594,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 				msg.Info.ID, chatJID, sender, emoji,
 				msg.Info.Timestamp, msg.Info.IsFromMe,
 				"reaction", reactedToID, "", nil, nil, nil, 0, "",
+				senderDisplay, emoji,
 			); err != nil {
 				logger.Warnf("Failed to store reaction: %v", err)
 			}
@@ -1519,6 +1619,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
+	// Resolve @mention tokens in the message text to display names.
+	// ContextInfo.MentionedJID contains the full JIDs for every @mention;
+	// resolveContentMentions substitutes each @<jid_user> with @<contact_name>.
+	contentDisplay := resolveContentMentions(client, content, extractMentionedJIDs(msg.Message))
+
 	// Store message in database first so that downloadMedia (which queries the DB
 	// by message ID) can find the row when we call it synchronously below.
 	err = messageStore.StoreMessage(
@@ -1536,6 +1641,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileEncSHA256,
 		fileLength,
 		quotedMessageId,
+		senderDisplay,
+		contentDisplay,
 	)
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
@@ -2811,6 +2918,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				// so any LID-based participant is resolved through the
 				// whatsmeow LID store (populated during live message handling).
 				var sender string
+				var histSenderDisplay string
 				isFromMe := false
 				if msg.Message.Key != nil {
 					if msg.Message.Key.FromMe != nil {
@@ -2833,9 +2941,15 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					if isFromMe && client.Store.ID != nil {
 						alt = client.Store.ID.ToNonAD()
 					}
-					sender = resolveUserJID(client, rawSender, alt).User
+					resolvedSenderJID := resolveUserJID(client, rawSender, alt)
+					sender = resolvedSenderJID.User
+					// Resolve sender display name using the contact store.
+					// History sync carries no ContextInfo so mention resolution
+					// in content is not possible here; content_display = content.
+					histSenderDisplay = resolveSenderDisplay(client, resolvedSenderJID, isFromMe, "")
 				} else {
 					sender = jid.User
+					histSenderDisplay = sender
 				}
 
 				// Store message
@@ -2866,6 +2980,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileEncSHA256,
 					fileLength,
 					"", // quoted_message_id: history sync does not carry ContextInfo
+					histSenderDisplay,
+					content, // content_display: no MentionedJID in history sync
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
