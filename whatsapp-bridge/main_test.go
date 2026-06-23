@@ -47,12 +47,39 @@ func (m *mockLIDStore) GetPNForLID(_ context.Context, lid types.JID) (types.JID,
 	return types.EmptyJID, nil
 }
 
+// mockContactStore implements store.ContactStore with an in-memory map keyed by
+// the non-AD JID, so tests can model whatsmeow splitting full_name and push_name
+// across a contact's phone (@s.whatsapp.net) and LID (@lid) rows.
+type mockContactStore struct {
+	store.NoopStore
+	byJID map[types.JID]types.ContactInfo
+}
+
+func (m *mockContactStore) GetContact(_ context.Context, user types.JID) (types.ContactInfo, error) {
+	if c, ok := m.byJID[user.ToNonAD()]; ok {
+		c.Found = true
+		return c, nil
+	}
+	return types.ContactInfo{}, nil
+}
+
 func newTestClient(lidStore store.LIDStore) *whatsmeow.Client {
 	noop := &store.NoopStore{}
 	return &whatsmeow.Client{
 		Store: &store.Device{
 			LIDs:     lidStore,
 			Contacts: noop,
+		},
+	}
+}
+
+// newTestClientWithContacts builds a test client backed by both a LID store and
+// an explicit contact store, for exercising name resolution.
+func newTestClientWithContacts(lidStore store.LIDStore, contacts store.ContactStore) *whatsmeow.Client {
+	return &whatsmeow.Client{
+		Store: &store.Device{
+			LIDs:     lidStore,
+			Contacts: contacts,
 		},
 	}
 }
@@ -106,6 +133,8 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			file_length INTEGER,
 			deleted_at TIMESTAMP,
 			quoted_message_id TEXT,
+			sender_display TEXT,
+			content_display TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -2153,5 +2182,107 @@ func TestExtractQuotedMessageInfo_NoContextInfo(t *testing.T) {
 				t.Errorf("expected all empty, got (%q, %q, %q)", id, sender, content)
 			}
 		})
+	}
+}
+
+// --- Display-name resolution (bestContactName / mentions) ---
+
+// savedContactLID / savedContactPN model a saved contact whose full_name lives
+// on the phone row while the @lid row is empty — the case where a group
+// @-mention carries the LID user-part and must be resolved through the LID->PN
+// map (Issue 2).
+var savedContactLID = types.JID{User: "100000000000001", Server: types.HiddenUserServer}
+var savedContactPN = types.JID{User: "10000000001", Server: types.DefaultUserServer}
+
+// unsavedContactLID / unsavedContactPN model an unsaved contact (no full_name)
+// whose push_name lives on the @lid row while the phone row is absent (Issue 1).
+var unsavedContactLID = types.JID{User: "100000000000002", Server: types.HiddenUserServer}
+var unsavedContactPN = types.JID{User: "10000000002", Server: types.DefaultUserServer}
+
+func displayTestClient() *whatsmeow.Client {
+	lids := &mockLIDStore{
+		lidByPN: map[types.JID]types.JID{savedContactPN: savedContactLID, unsavedContactPN: unsavedContactLID},
+		pnByLID: map[types.JID]types.JID{savedContactLID: savedContactPN, unsavedContactLID: unsavedContactPN},
+	}
+	contacts := &mockContactStore{byJID: map[types.JID]types.ContactInfo{
+		savedContactPN:  {FullName: "Alice Example"},
+		unsavedContactLID: {PushName: "Bob Example"},
+	}}
+	return newTestClientWithContacts(lids, contacts)
+}
+
+func TestBestContactName(t *testing.T) {
+	client := displayTestClient()
+	cases := []struct {
+		name string
+		jid  types.JID
+		want string
+	}{
+		{"lid resolves to phone full_name", savedContactLID, "Alice Example"},
+		{"phone keeps its full_name", savedContactPN, "Alice Example"},
+		{"phone resolves to lid push_name", unsavedContactPN, "Bob Example"},
+		{"lid keeps its push_name", unsavedContactLID, "Bob Example"},
+		{"unknown jid yields empty", types.JID{User: "9999", Server: types.DefaultUserServer}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := bestContactName(client, tc.jid); got != tc.want {
+				t.Errorf("bestContactName(%s) = %q, want %q", tc.jid, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBestContactName_PrefersFullNameOverPushName(t *testing.T) {
+	lids := &mockLIDStore{
+		lidByPN: map[types.JID]types.JID{savedContactPN: savedContactLID},
+		pnByLID: map[types.JID]types.JID{savedContactLID: savedContactPN},
+	}
+	// full_name on the phone row, a different push_name on the LID row.
+	contacts := &mockContactStore{byJID: map[types.JID]types.ContactInfo{
+		savedContactPN:  {FullName: "Alice Example"},
+		savedContactLID: {PushName: "Ali"},
+	}}
+	client := newTestClientWithContacts(lids, contacts)
+	if got := bestContactName(client, savedContactLID); got != "Alice Example" {
+		t.Errorf("expected full_name to win, got %q", got)
+	}
+}
+
+func TestResolveContentMentions_LIDTokenResolvedToName(t *testing.T) {
+	client := displayTestClient()
+	content := "@100000000000001 can you check this?"
+	got := resolveContentMentions(client, content, []string{savedContactLID.String()})
+	want := "@Alice Example can you check this?"
+	if got != want {
+		t.Errorf("resolveContentMentions = %q, want %q", got, want)
+	}
+}
+
+func TestResolveContentMentions_UnknownLeftAsIs(t *testing.T) {
+	client := displayTestClient()
+	content := "@100000000000099 ping"
+	unknown := types.JID{User: "100000000000099", Server: types.HiddenUserServer}
+	if got := resolveContentMentions(client, content, []string{unknown.String()}); got != content {
+		t.Errorf("unknown mention should be untouched, got %q", got)
+	}
+}
+
+func TestResolveSenderDisplay(t *testing.T) {
+	client := displayTestClient()
+	if got := resolveSenderDisplay(client, savedContactPN, false, ""); got != "Alice Example" {
+		t.Errorf("expected Alice Example, got %q", got)
+	}
+	// No contact match, but a live push name is available.
+	unknown := types.JID{User: "19995550100", Server: types.DefaultUserServer}
+	if got := resolveSenderDisplay(client, unknown, false, "Livepush"); got != "Livepush" {
+		t.Errorf("expected live push fallback, got %q", got)
+	}
+	// Nothing known at all: fall back to the bare number.
+	if got := resolveSenderDisplay(client, unknown, false, ""); got != "19995550100" {
+		t.Errorf("expected bare number fallback, got %q", got)
+	}
+	if got := resolveSenderDisplay(client, savedContactPN, true, ""); got != "Me" {
+		t.Errorf("expected Me for self, got %q", got)
 	}
 }

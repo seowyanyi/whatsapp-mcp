@@ -1453,6 +1453,54 @@ func senderAltForMessage(client *whatsmeow.Client, info types.MessageInfo) types
 	return types.EmptyJID
 }
 
+// bestContactName returns the best human-readable name for a user JID, or "" if
+// none is known. WhatsApp's LID migration means a single person has two JID
+// forms — phone (@s.whatsapp.net) and link-ID (@lid) — and whatsmeow stores
+// contact data under whichever form it learned about. In practice full_name
+// (from the saved address book) lands on the phone row while push_name (the
+// self-set display name) lands on the LID row, so a lookup on only one form
+// misses the name entirely. We therefore look up *both* forms, preferring
+// full_name across either over push_name across either.
+func bestContactName(client *whatsmeow.Client, jid types.JID) string {
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return ""
+	}
+	ctx := context.Background()
+	jid = jid.ToNonAD()
+
+	candidates := []types.JID{jid}
+	if client.Store.LIDs != nil {
+		switch jid.Server {
+		case types.HiddenUserServer: // @lid -> also try the mapped phone JID
+			if pn, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+				candidates = append(candidates, pn.ToNonAD())
+			}
+		case types.DefaultUserServer: // phone -> also try the mapped LID JID
+			if lid, err := client.Store.LIDs.GetLIDForPN(ctx, jid); err == nil && !lid.IsEmpty() {
+				candidates = append(candidates, lid.ToNonAD())
+			}
+		}
+	}
+
+	var fullName, pushName string
+	for _, c := range candidates {
+		contact, err := client.Store.Contacts.GetContact(ctx, c)
+		if err != nil {
+			continue
+		}
+		if fullName == "" && contact.FullName != "" {
+			fullName = contact.FullName
+		}
+		if pushName == "" && contact.PushName != "" {
+			pushName = contact.PushName
+		}
+	}
+	if fullName != "" {
+		return fullName
+	}
+	return pushName
+}
+
 // resolveSenderDisplay returns the best human-readable name for a message sender.
 // It checks whatsmeow's in-memory contact store (populated from the phone's
 // contact list) before falling back to the live push name or the bare JID user.
@@ -1460,14 +1508,8 @@ func resolveSenderDisplay(client *whatsmeow.Client, sender types.JID, isFromMe b
 	if isFromMe {
 		return "Me"
 	}
-	contact, err := client.Store.Contacts.GetContact(context.Background(), sender)
-	if err == nil {
-		if contact.FullName != "" {
-			return contact.FullName
-		}
-		if contact.PushName != "" {
-			return contact.PushName
-		}
+	if name := bestContactName(client, sender); name != "" {
+		return name
 	}
 	if pushName != "" {
 		return pushName
@@ -1513,14 +1555,13 @@ func resolveContentMentions(client *whatsmeow.Client, content string, mentionedJ
 		if err != nil {
 			continue
 		}
-		name := jid.User
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil {
-			if contact.FullName != "" {
-				name = contact.FullName
-			} else if contact.PushName != "" {
-				name = contact.PushName
-			}
+		// The token in the text is "@"+jid.User (often a raw @lid number, since
+		// WhatsApp emits LID-form mentions in groups). bestContactName resolves
+		// across both the LID and phone forms; leave the token untouched when no
+		// name is known rather than substituting the number for itself.
+		name := bestContactName(client, jid)
+		if name == "" {
+			continue
 		}
 		content = strings.ReplaceAll(content, "@"+jid.User, "@"+name)
 	}
@@ -2741,10 +2782,10 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
+		// Use contact info (full_name preferred, then push_name), checking both
+		// the LID and phone forms of the JID.
+		if contactName := bestContactName(client, jid); contactName != "" {
+			name = contactName
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender
